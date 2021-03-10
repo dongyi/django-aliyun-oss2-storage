@@ -3,7 +3,7 @@
 import os
 
 import datetime
-import six
+import io
 import posixpath
 
 try:
@@ -63,6 +63,10 @@ class AliyunBaseStorage(BucketOperationMixin, Storage):
         self.end_point = _normalize_endpoint(self._get_config('END_POINT').strip())
         self.bucket_name = self._get_config('BUCKET_NAME')
         self.cname = self._get_config('ALIYUN_OSS_CNAME')
+        try:
+            self.is_https = self._get_config('ALIYUN_OSS_HTTPS')
+        except ImproperlyConfigured:
+            self.is_https = False
 
         self.auth = Auth(self.access_key_id, self.access_key_secret)
         self.service = Service(self.auth, self.end_point)
@@ -85,7 +89,7 @@ class AliyunBaseStorage(BucketOperationMixin, Storage):
         """
         config = os.environ.get(name, getattr(settings, name, None))
         if config is not None:
-            if isinstance(config, six.string_types):
+            if isinstance(config, str):
                 return config.strip()
             else:
                 return config
@@ -129,13 +133,11 @@ class AliyunBaseStorage(BucketOperationMixin, Storage):
         return final_path.lstrip('/')
 
     def _get_target_name(self, name):
-        name = self._normalize_name(self._clean_name(name))
-        if six.PY2:
-            name = name.encode('utf-8')
-        return name
+        return self._normalize_name(self._clean_name(name))
 
     def _open(self, name, mode='rb'):
-        return AliyunFile(name, self, mode)
+        f= AliyunFile(name, self, mode)
+        return f
 
     def _save(self, name, content):
         # 为保证django行为的一致性，保存文件时，应该返回相对于`media path`的相对路径。
@@ -181,10 +183,14 @@ class AliyunBaseStorage(BucketOperationMixin, Storage):
 
     def url(self, name):
         name = self._normalize_name(self._clean_name(name))
-        # name = filepath_to_uri(name) # 这段会导致二次encode
-        name = name.encode('utf8') 
+        name = name.encode('utf8')
         # 做这个转化，是因为下面的_make_url会用urllib.quote转码，转码不支持unicode，会报错，在python2环境下。
-        return self.bucket._make_url(self.bucket_name, name)
+        ret = self.bucket._make_url(self.bucket_name, name)
+        ret = ret.replace('%2F', '/')
+        if self.is_https and ret.startswith('http://'):
+            return 'https' + ret[4:]
+        else:
+            return ret
 
     def read(self, name):
         pass
@@ -208,16 +214,35 @@ class AliyunFile(File):
     def __init__(self, name, storage, mode):
         self._storage = storage
         self._name = name[len(self._storage.location):]
+        if name.startswith(self._storage.location):
+            self._name = name[len(self._storage.location):]
+        else:
+            self._name = self._storage.location + name
+            if self._name.startswith('/'):
+                self._name = self._name[1:]
+        #self._name = self._storage.location + self._name
         self._mode = mode
-        self.file = six.BytesIO()
+        self.file = io.BytesIO()
         self._is_dirty = False
         self._is_read = False
+
         super(AliyunFile, self).__init__(self.file, self._name)
+
+    def open(self, mode):
+        if not self.closed:
+            self.seek(0)
+        elif self.name:
+            content = self._storage.bucket.get_object(self._name)
+            self.file = io.BytesIO(content.read())
+            self.closed = Fasle
+        else:
+            raise ValueError("The file cannot be reopened.")
+        return self
 
     def read(self, num_bytes=None):
         if not self._is_read:
             content = self._storage.bucket.get_object(self._name)
-            self.file = six.BytesIO(content.read())
+            self.file = io.BytesIO(content.read())
             self._is_read = True
 
         if num_bytes is None:
